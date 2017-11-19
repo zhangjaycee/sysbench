@@ -52,6 +52,14 @@
 #define NS2MS(nsec) ((nsec)/1000000.)
 #define MS2NS(sec)  ((sec)*1000000ULL)
 
+/* Convert nanoseconds to microseconds and vice versa */
+#define NS2US(nsec) ((nsec)/1000.)
+#define US2NS(sec)  ((sec)*1000ULL)
+
+/* Convert microseconds to seconds and vice versa */
+#define US2SEC(msec) ((msec)/1000000.)
+#define SEC2US(sec) ((sec)*1000000)
+
 /* Convert milliseconds to seconds and vice versa */
 #define MS2SEC(msec) ((msec)/1000.)
 #define SEC2MS(sec) ((sec)*1000)
