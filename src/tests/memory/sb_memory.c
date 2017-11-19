@@ -101,8 +101,14 @@ static TLS size_t *tls_buf_end;
 
 /* Array of per-thread buffers */
 static size_t **buffers;
+static size_t **cpy_dsts;
+static size_t *seq_offsets;
+
 /* Global buffer */
 static size_t *buffer;
+
+static size_t *cpy_dst;
+static size_t seq_offset;
 
 #ifdef HAVE_LARGE_PAGES
 static void * hugetlb_alloc(size_t size);
@@ -179,7 +185,7 @@ int memory_init(void)
       buffer = hugetlb_alloc(memory_block_size);
     else
 #endif
-      buffer = sb_memalign(memory_block_size, sb_getpagesize());
+      buffer = sb_memalign(memory_total_size, sb_getpagesize());
 
     if (buffer == NULL)
     {
@@ -187,11 +193,17 @@ int memory_init(void)
       return 1;
     }
 
-    memset(buffer, 0, memory_block_size);
+    memset(buffer, 0, memory_total_size);
+
+    cpy_dst = valloc(memory_block_size);
+    memset(cpy_dst, 0, memory_block_size);
+
+    seq_offset = 0;
   }
   else
   {
     buffers = malloc(sb_globals.threads * sizeof(void *));
+    cpy_dsts = malloc(sb_globals.threads * sizeof(void *));
     if (buffers == NULL)
     {
       log_text(LOG_FATAL, "Failed to allocate buffers array!");
@@ -204,7 +216,7 @@ int memory_init(void)
         buffers[i] = hugetlb_alloc(memory_block_size);
       else
 #endif
-        buffers[i] = sb_memalign(memory_block_size, sb_getpagesize());
+        buffers[i] = sb_memalign(memory_total_size, sb_getpagesize());
 
       if (buffers[i] == NULL)
       {
@@ -212,7 +224,12 @@ int memory_init(void)
         return 1;
       }
 
-      memset(buffers[i], 0, memory_block_size);
+      memset(buffers[i], 0, memory_total_size);
+
+      cpy_dsts[i] = valloc(memory_block_size);
+      memset(cpy_dsts[i], 0, memory_block_size);
+
+      seq_offset = 0;
     }
   }
 
@@ -261,13 +278,14 @@ int memory_thread_init(int thread_id)
     break;
   case SB_MEM_SCOPE_LOCAL:
     tls_buf = buffers[thread_id];
+    cpy_dst = cpy_dsts[thread_id];
     break;
   default:
     log_text(LOG_FATAL, "Invalid memory scope");
     return 1;
   }
 
-  tls_buf_end = (size_t *) (void *) ((char *) tls_buf + memory_block_size);
+  tls_buf_end = (size_t *) (void *) ((char *) tls_buf + memory_total_size);
 
   return 0;
 }
@@ -310,13 +328,7 @@ int event_rnd_none(sb_event_t *req, int thread_id)
   (void) req; /* unused */
   (void) thread_id; /* unused */
 
-  for (ssize_t i = 0; i < memory_block_size; i += SIZEOF_SIZE_T)
-  {
-    size_t offset = (volatile size_t) (sb_rand_uniform_double() *
-                                       (memory_block_size / SIZEOF_SIZE_T));
-    (void) offset; /* unused */
-    /* nop */
-  }
+  size_t offset = (size_t) (sb_rand_uniform_double() *(memory_total_size / SIZEOF_SIZE_T));
 
   return 0;
 }
@@ -327,13 +339,8 @@ int event_rnd_read(sb_event_t *req, int thread_id)
   (void) req; /* unused */
   (void) thread_id; /* unused */
 
-  for (ssize_t i = 0; i < memory_block_size; i += SIZEOF_SIZE_T)
-  {
-    size_t offset = (size_t) (sb_rand_uniform_double() *
-                              (memory_block_size / SIZEOF_SIZE_T));
-    size_t val = SIZE_T_LOAD(tls_buf + offset);
-    (void) val; /* unused */
-  }
+  size_t offset = (size_t) (sb_rand_uniform_double() *(memory_total_size / SIZEOF_SIZE_T));
+  memcpy(cpy_dst, tls_buf + offset, memory_block_size);
 
   return 0;
 }
@@ -344,12 +351,8 @@ int event_rnd_write(sb_event_t *req, int thread_id)
   (void) req; /* unused */
   (void) thread_id; /* unused */
 
-  for (ssize_t i = 0; i < memory_block_size; i += SIZEOF_SIZE_T)
-  {
-    size_t offset = (size_t) (sb_rand_uniform_double() *
-                              (memory_block_size / SIZEOF_SIZE_T));
-    SIZE_T_STORE(tls_buf + offset, i);
-  }
+  size_t offset = (size_t) (sb_rand_uniform_double() *(memory_total_size / SIZEOF_SIZE_T));
+  memcpy(tls_buf + offset, cpy_dst, memory_block_size);
 
   return 0;
 }
@@ -360,12 +363,7 @@ int event_seq_none(sb_event_t *req, int thread_id)
   (void) req; /* unused */
   (void) thread_id; /* unused */
 
-  for (size_t *buf = tls_buf, *end = buf + memory_block_size / SIZEOF_SIZE_T;
-       buf < end; buf++)
-  {
-    ck_pr_barrier();
-    /* nop */
-  }
+  seq_offset += memory_block_size / SIZEOF_SIZE_T;
 
   return 0;
 }
@@ -376,12 +374,8 @@ int event_seq_read(sb_event_t *req, int thread_id)
   (void) req; /* unused */
   (void) thread_id; /* unused */
 
-  for (size_t *buf = tls_buf, *end = buf + memory_block_size / SIZEOF_SIZE_T;
-       buf < end; buf++)
-  {
-    size_t val = SIZE_T_LOAD(buf);
-    (void) val; /* unused */
-  }
+  memcpy(cpy_dst, tls_buf + seq_offset, memory_block_size);
+  seq_offset += memory_block_size / SIZEOF_SIZE_T;
 
   return 0;
 }
@@ -392,11 +386,8 @@ int event_seq_write(sb_event_t *req, int thread_id)
   (void) req; /* unused */
   (void) thread_id; /* unused */
 
-  for (size_t *buf = tls_buf, *end = buf + memory_block_size / SIZEOF_SIZE_T;
-       buf < end; buf++)
-  {
-    SIZE_T_STORE(buf, end - buf);
-  }
+  memcpy(tls_buf, cpy_dst, memory_block_size);
+  seq_offset += memory_block_size / SIZEOF_SIZE_T;
 
   return 0;
 }
